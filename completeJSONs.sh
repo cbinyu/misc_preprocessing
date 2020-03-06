@@ -47,7 +47,7 @@ add_numberofvols() {
     nVols=( $(fslnvols ${niiFile}) )
 
     #
-    # Let's figure out if we need to create a brand new field or just entries to an existing one
+    # Let's figure out if we need to create a brand new field or just add entries to an existing one
     test $(grep -c "\"NumberOfVolumes\":" $jFile) -gt 0
     let insertIt=$?
 
@@ -59,30 +59,22 @@ add_numberofvols() {
 	sed -i -e "s/\([ ]*\)\"NumberOfVolumes\": \([0-9]*\),/\1\"NumberOfVolumes\": ${nVols},/" $jFile
 
     else
-	# get a list of all the fields:
-	fieldList=( $(egrep -o "\".*\":" $jFile) )
-	# if the list is empty, this is not a json file:
-	if [ -z $fieldList ]
-	then
-	    echo "Invalid json file $jFile"
-	    return
-	fi
+	# Add the "NumberOfVolumes" field at the end of the file:
 
-	# add "NumberOfVolumes" to the fields, sort them and find the one that will
-	#   go right after it in that list:
-	postField=${fieldList[(( $(printf "%s\n" ${fieldList[@]} "\"NumberOfVolumes\":" | sort | grep -n NumberOfVolumes | cut -d ":" -f 1) - 1 ))]}
-
-	# now, find how many lines from the original file we need to grab (from the
-	#   beginning, down to the one right above $postField
-	let preLen=( $(grep $postField -n $jFile | cut -d : -f 1) - 1 )
-
-	# Then, copy those lines to the temporary json file:
+	# Find the last line that starts with a "}".
+	# (We don't assume that it is the very last line in the file)
+	let preLen=( $(grep "^}" -n $jFile | cut -d : -f 1) - 1 )
+    
+	# Then, copy those lines to the temporary json file and
+	#   add a comma at the end:
 	tmpFile=$(mktemp /tmp/XXXXXXXX.json)
-	head -n $preLen $jFile > $tmpFile
+	foo=$(head -n $preLen $jFile)
+        echo "${foo}," > $tmpFile
 
-	# Add the new field we want to include:
-	echo "  \"NumberOfVolumes\": ${nVols}," >> $tmpFile
-
+	# Add the new field we want to include (without a comma at the end,
+	#   since this is the last field):
+	echo "  \"NumberOfVolumes\": ${nVols}" >> $tmpFile
+	
 	# And copy the rest of the file right afterwards:
 	let postLen=( $(cat $jFile | wc -l) - $preLen + 1)
 	tail -n $postLen $jFile >> $tmpFile
@@ -114,9 +106,10 @@ read_header_param() {
     # If line ends in '[' multiple values, otherwise just one
     if [ $(egrep -c "$paramName\":.*\[" $jsonFile) -eq 1 ]
     then
-	myTmp=$(egrep -zo "$paramName\": *\[ *\s([^],]*,\s)*[[:print:]]*\s *]" $jsonFile)
+	# grab whatever is between the square brackets following '"$paramName":'
+	myTmp=$(egrep -zo "$paramName\": \[([^]]+)\]" $jsonFile)
 	myTmp=${myTmp#*[}
-	echo ${myTmp% ]}
+	echo ${myTmp%]}
     else
 	myTmp=$(egrep "$paramName\":.*," $jsonFile)
 	myTmp=${myTmp#*: }
@@ -254,25 +247,16 @@ add_intendedfor() {
 	# Get a list of the "IntendedFor" files originally in the json file:
 	originalFiles=$(read_header_param ${myString} ${jFile})
     else
-	# get a list of all the fields:
-	fieldList=( $(egrep -o "\".*\":" $jFile) )
-	# if the list is empty, this is not a json file:
-	if [ -z $fieldList ]
-	then
-	    echo "Invalid json file $jFile"
-	    return
-	fi
+	# Add the "IntendedFor" field at the end of the file:
 
-	# add "IntendedFor" to the fields, sort them and find the one that will
-	#   go right after it in that list:
-	postField=${fieldList[(( $(printf "%s\n" ${fieldList[@]} "\"${myString}\":" | sort | grep -n ${myString} | cut -d ":" -f 1) - 1 ))]}
-
-	# now, find how many lines from the original file we need to grab (from the
-	#   beginning, down to the one right above $postField
-	let preLen=( $(grep $postField -n $jFile | cut -d : -f 1) - 1 )
-
-	# Then, copy those lines to the temporary json file:
-	head -n $preLen $jFile > $tmpFile
+	# Find the last line that starts with a "}".
+	# (We don't assume that it is the very last line in the file)
+	let preLen=( $(grep "^}" -n $jFile | cut -d : -f 1) - 1 )
+    
+	# Then, copy those lines to the temporary json file and
+	#   add a comma at the end:
+	foo=$(head -n $preLen $jFile)
+        echo "${foo}," > $tmpFile
 
 	# write "IntendedFor": [ to the $tmpFile
 	echo "  \"${myString}\": [" >> $tmpFile
@@ -284,6 +268,12 @@ add_intendedfor() {
     # now, check how many lines are there from $preLen to the end of the file
     #  (we'll copy those lines at the end of $tmpFile later):
     let postLen=( $(cat $jFile | wc -l) - $preLen )
+    # (If the original json file ends with "}" with no new line at the end.
+    #  In that case, postLen might be 0, but we want to copy that last line):
+    if [ $postLen -eq 0 ]
+    then
+	postLen=1
+    fi
 
     # loop through the $fileList and add them:
     let fileIndex=0
@@ -314,7 +304,19 @@ add_intendedfor() {
     sed -i '$ s/,$//' $tmpFile
     
     # close square bracket:
-    echo "  ]," >> $tmpFile
+    if [ $insertIt -eq 0 ]
+    then
+	# copy the line with the closing square bracket from the original
+	#   file.  This way, if it was in the middle of the file, it will
+	#   add the comma after the "]", and if it was at the end, it will
+	#   only add "]".
+	# The last line of the "IntendedFor" will be line $preLen
+	sed "${preLen}q;d" $jFile >> $tmpFile
+    else
+	# if we added it, since we added it at the end of the file, it
+	#   will be the last field, and doesn't have a comma after it.
+	echo "  ]" >> $tmpFile
+    fi
 
     # copy rest of file
     tail -n $postLen $jFile >> $tmpFile
@@ -379,6 +381,8 @@ fi
 # Get a list of all fmap json files in the session:
 fmapFolder=${session}/fmap
 fmapJsonList=( $(ls ${fmapFolder}/*.json 2> /dev/null) )
+# Exclude filenames with *_rec-phase_* in it:
+fmapJsonList=( $(printf "%s\n" ${fmapJsonList[@]} | grep -v "_rec-phase_") )
 [ $verbose ] && echo "fmapJsonList:"
 [ $verbose ] && printf "%s\n" ${fmapJsonList[@]}
 
@@ -472,6 +476,7 @@ do
     		then
 	        {
 		    # Check that it has the same acquisition type and run number as ${thisFMap}:
+		    # (they will differ in the "dir-")
 		    fmAcqAndRun=$(get_acq_and_run ${fm})
 		    if [ "$fmAcqAndRun" == "$fmapAcqAndRun" ]
 		    then
