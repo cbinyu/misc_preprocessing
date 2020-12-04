@@ -1,14 +1,12 @@
 #!/bin/bash
 
-source /CBI/CBI.sh
-
-verbose=       # non-verbose
-#verbose=true   # verbose output
-
 # Script to complete the json files after conversion into BIDS format
 #
-#   1) Add the number of repetitions to the functional runs jsons
+#   1) Add the number of repetitions to the functional runs jsons.
 #   2) Populate the 'Intendedfor' field in the json files for the field maps.
+#   3) Fix the "CogAtlasID" field for all the task json files.
+#
+#   It is supposed to run on Linux and Mac OSX, and needs either FSL, FreeSurfer or AFNI.
 #
 #   Note: the logic behind the way we decide how to populate the "IntendedFor" is:
 #     We want all images in the session (except for the fmap images themselves) to
@@ -20,10 +18,92 @@ verbose=       # non-verbose
 #     user's intentions were different, he will have to manually edit the fmap json files.
 #
 
-# check if FSL has been configured:
-if [ -z "$FSLOUTPUTTYPE" ]; then
-   . ${FSLDIR}/etc/fslconf/fsl.sh
+show_usage() {
+cat <<EOF
+completeJSONs.sh: Script to complete the json files after conversion into BIDS format
+
+Usage: completeJSONs.sh <BIDS-session>
+    <BIDS-session>: path to the session to process.
+          If the subject's data doesn't include sessions, use the path
+          to the subject's folder
+EOF
+}
+
+
+# Check number of parameters:
+if [ "$#" = "0" ]; then
+    echo "Illegal number of parameters"
+    show_usage
+    exit 1
 fi
+
+verbose=       # non-verbose by default
+if [[ $# -eq 2 ]] && [[ $2 == true ]]; then
+    verbose=true        # verbose output
+fi
+
+if [ -f /CBI/CBI.sh ]; then
+    source /CBI/CBI.sh
+fi
+
+# Check what tool we have installed in the system to get info from NIfTI files:
+if [ ! -z "${FSLDIR+x}" ]; then
+    NIFTI_TOOL=FSL
+    # check if FSL has been configured:
+    if [ -z "$FSLOUTPUTTYPE" ]; then
+   .    ${FSLDIR}/etc/fslconf/fsl.sh
+    fi
+elif [ ! -z "${FREESURFER_HOME+x}" ]; then
+    NIFTI_TOOL=FREESURFER
+elif [ command -v afni &> /dev/null ]; then
+    NIFTI_TOOL=AFNI
+else
+    echo "We didn't find a tool to get info from NIfTI files."
+    echo "You need to have FSL, FreeSurfer or AFNI installed, "
+    echo "and the variables FSLDIR or FREESURFER_HOME set."
+    exit 1
+fi
+echo "NIFTI_TOOL: $NIFTI_TOOL"
+
+
+#     #     #     #     #     #     #     #     #     #     #     #     #     #     #     
+#
+# get_numberofvolumes()
+#
+# Description:
+# 
+#   Gets the number of volumes from a NIfTI file
+#
+#   We can either use FSL or FreeSurfer, whichever is found in the system
+#
+# Input:
+# 
+#   The NIfTI file
+#
+get_numberofvolumes() {
+    f="$1"
+
+    case $NIFTI_TOOL in
+
+	FSL)
+	    nvols=$( ${FSLDIR}/bin/fslnvols "$f" )    # <-- This is the output of the function
+	    ;;
+
+	FREESURFER)
+	    nvols=$( ${FREESURFER_HOME}/bin/mri_info "$f" --nframes )
+	    ;;
+
+	AFNI)
+	    nvols=$( 3dinfo -nv "$f" )
+	    ;;
+
+	*)
+	    echo "NIFTI_TOOL is incorrect. We can't proceed."
+	    exit 1
+    esac
+    echo $nvols        # <-- This is the output of the function
+    return
+}
 
 
 #     #     #     #     #     #     #     #     #     #     #     #     #     #     #     
@@ -44,12 +124,13 @@ add_numberofvols() {
     niiFile=( $(ls ${jFile%.json}.nii*) )
 
     # get number of volumes
-    nVols=( $(fslnvols ${niiFile}) )
+    nVols=( $(get_numberofvolumes ${niiFile}) )
 
     #
     # Let's figure out if we need to create a brand new field or just add entries to an existing one
     test $(grep -c "\"NumberOfVolumes\":" $jFile) -gt 0
     let insertIt=$?
+    [ $verbose ] && echo "Insert? $insertIt"
 
     #
     # If field already present, just overwrite it. If not, figure out where to place it:
@@ -63,11 +144,11 @@ add_numberofvols() {
 
 	# Find the last line that starts with a "}".
 	# (We don't assume that it is the very last line in the file)
-	let preLen=( $(grep "^}" -n $jFile | cut -d : -f 1) - 1 )
-    
+	((preLen=( $(grep "^}" -n $jFile | cut -d : -f 1) - 1 )))
+
 	# Then, copy those lines to the temporary json file and
 	#   add a comma at the end:
-	tmpFile=$(mktemp /tmp/XXXXXXXX.json)
+	tmpFile=$(mktemp "${TMPDIR:-/tmp}/foo.XXXXXXXX.json")
 	foo=$(head -n $preLen $jFile)
         echo "${foo}," > $tmpFile
 
@@ -76,7 +157,7 @@ add_numberofvols() {
 	echo "  \"NumberOfVolumes\": ${nVols}" >> $tmpFile
 	
 	# And copy the rest of the file right afterwards:
-	let postLen=( $(cat $jFile | wc -l) - $preLen + 1)
+	((postLen=( $(cat $jFile | wc -l) - $preLen + 1)))
 	tail -n $postLen $jFile >> $tmpFile
 
 	# Finally, replace the original json file with the temporal one:
@@ -107,7 +188,7 @@ read_header_param() {
     if [ $(egrep -c "$paramName\":.*\[" $jsonFile) -eq 1 ]
     then
 	# grab whatever is between the square brackets following '"$paramName":'
-	myTmp=$(egrep -zo "$paramName\": \[([^]]+)\]" $jsonFile)
+	myTmp=$(egrep -o "$paramName\": \[([^]]+)\]" $jsonFile)
 	myTmp=${myTmp#*[}
 	echo ${myTmp%]}
     else
@@ -127,7 +208,7 @@ read_header_param() {
 # 
 #   Get the dimensions and other relevant params from a .json file
 #
-#   I'm going to use 'fslinfo' because the only way to get the number of
+#   I'm going to use 'fslinfo' or 'mri_info' because the only way to get the dimensions
 #     slices from the json field is by reading the SliceTiming, which seems
 #     very convoluted to me.  Also, you can get the image dimensions and 
 #     resolution all in one line.
@@ -142,10 +223,31 @@ read_header_param() {
 #
 get_json_dims_etc() {
     jsonFile="$1"
+    f=$(ls ${jsonFile%.json}.nii*)
 
-    # run 'fslinfo', get only the lines dim1-3 or pixdim1-3, consolidate
-    #   multiple spaces, and get the second field (the values themselves):
-    foo=($(fslinfo ${jsonFile%.json} | grep dim[1-3] | tr -s [:blank:] | cut -d$' ' -f 2))
+    case $NIFTI_TOOL in
+
+	FSL)
+	    # run 'fslinfo', get only the lines dim1-3 or pixdim1-3, consolidate
+	    #   multiple spaces, and get the second field (the values themselves):
+	    foo=($(fslinfo "$f" | grep dim[1-3] | tr -s [:blank:] | cut -d$' ' -f 2))
+	    ;;
+
+	FREESURFER)
+            foo=$( (${FREESURFER_HOME}/bin/mri_info "$f" --dim \
+	               && ${FREESURFER_HOME}/bin/mri_info "$f" --res) \
+		       | cut -d$' ' -f1-3 )
+	    ;;
+
+	AFNI)
+	    # get the four dimensions, plus the voxel size, remove blank space
+	    foo=$( 3dinfo -n4 -ad3 "$f" | tr "[:blank:]" " " | cut -d$' ' -f1-3,5-7 )
+	    ;;
+
+	*)
+	    echo "NIFTI_TOOL is incorrect. We can't proceed."
+	    exit 1
+    esac
 
     # keep only 3 significant digits:
     dimsEtc=$(for d in ${foo[@]}; do echo "scale=3; ${d}/1" | bc; done)
@@ -226,24 +328,25 @@ add_intendedfor() {
 
     #
     # Work on a temp file:
-    tmpFile=$(mktemp /tmp/XXXXXXXX.json)
+    tmpFile=$(mktemp "${TMPDIR:-/tmp}/foo.XXXXXXXX.json")
 
     #
     # Let's figure out if we need to create a brand new field or just entries to an existing one
     test $(grep -c "\"${myString}\":" $jFile) -gt 0
     let insertIt=$?
+    [ $verbose ] && echo "Insert? $insertIt"
 
     #
     # Figure out how many lines to copy from original. If field not already present, figure out where to place it
     if [ $insertIt -eq 0 ]
     then
 	# Already there
-	let preLen=( $(grep "\"${myString}\":" -n $jFile | cut -d : -f 1) + $(read_header_param ${myString} $jFile | wc -w) )
+	((preLen=( $(grep "\"${myString}\":" -n $jFile | cut -d : -f 1) + $(read_header_param ${myString} $jFile | wc -w) )))
 	echo -n "$(head -n $preLen $jFile)" > $tmpFile
 	echo "," >> $tmpFile
 	# since "IntendedFor" was already there, there is a "]," at the end of it.
 	#  So set preLen to one more so we don't copy it again:
-	let preLen=$(( $preLen + 1 ))
+	((preLen=$(( $preLen + 1 ))))
 	# Get a list of the "IntendedFor" files originally in the json file:
 	originalFiles=$(read_header_param ${myString} ${jFile})
     else
@@ -251,7 +354,7 @@ add_intendedfor() {
 
 	# Find the last line that starts with a "}".
 	# (We don't assume that it is the very last line in the file)
-	let preLen=( $(grep "^}" -n $jFile | cut -d : -f 1) - 1 )
+	((preLen=( $(grep "^}" -n $jFile | cut -d : -f 1) - 1 )))
     
 	# Then, copy those lines to the temporary json file and
 	#   add a comma at the end:
@@ -267,7 +370,7 @@ add_intendedfor() {
 
     # now, check how many lines are there from $preLen to the end of the file
     #  (we'll copy those lines at the end of $tmpFile later):
-    let postLen=( $(cat $jFile | wc -l) - $preLen )
+    ((postLen=( $(cat $jFile | wc -l) - $preLen )))
     # (If the original json file ends with "}" with no new line at the end.
     #  In that case, postLen might be 0, but we want to copy that last line):
     if [ $postLen -eq 0 ]
@@ -301,7 +404,7 @@ add_intendedfor() {
 
     # In case "IntendedFor" already existed, but we didn't add any new
     #   functional files to the list, remove the last comma in the last line:
-    sed -i '$ s/,$//' $tmpFile
+    sed -i -e '$ s/,$//' $tmpFile
     
     # close square bracket:
     if [ $insertIt -eq 0 ]
@@ -335,7 +438,10 @@ add_intendedfor() {
 # remove the trailing slash, just in case:
 session=${1%/}
 # Get the full path:
-session=$(realpath $session)
+session=$(
+    realpath $session 2> /dev/null \
+	|| python -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' $session \
+)
 
 ## For all the functional runs, add the number of volumes in the image file:
 echo "Adding 'NumberOfVolumes' to the functional runs in ${session}"
@@ -347,7 +453,6 @@ for jsonFile in ${funcJsonList[@]}
 do
     add_numberofvols ${jsonFile}
 done
-
 
 ## For the fieldmap runs, add the IntendedFor field:
 #
@@ -369,7 +474,7 @@ done
 echo "Adding 'IntendedFor' to the fieldmap runs in ${session}"
 
 # Check if we are in a Session sub-folder for a subject:
-sesBasename=$(basename ${session}) 
+sesBasename=$(basename ${session})
 if [ ${sesBasename#ses-} == ${sesBasename} ]
 then
     subString="${session}/"    # the subject string is all the session
@@ -515,3 +620,17 @@ do
     let fmapJFindex+=1
 }
 done
+
+## For all the task json files, fix the "CogAtlasID" field:
+#   Checks the json file to see if the key "CogAtlasID" value is "TODO" (bug in heudiconv)
+#   If that it the case, it sets it to "doi:TODO" so that it's BIDS compliant.
+echo "Fixing task json files in ${session}"
+
+bidsFolder=${session%/sub-*}
+
+# To be able to run "find" you need to cd to a place where we have access,
+# and it is possible that the call to "completeJSONs" is done from a place
+# from which we don't have access
+cd /tmp
+find ${bidsFolder} -type f -name "task-*.json" \
+     -exec sed -i -e 's/"CogAtlasID": "TODO",/"CogAtlasID": "doi:TODO",/' {} +
